@@ -7,15 +7,17 @@ from scipy.io import loadmat
 import matplotlib.pyplot as plt
 from mpl_toolkits import mplot3d
 from tqdm import tqdm
+from itertools import combinations
 
 ### simulation parameters
 
-PHI = np.deg2rad(180) # azimuth of wavefront source
+np.random.seed(0)
+PHI = np.deg2rad(120) # azimuth of wavefront source
 THETA = np.deg2rad(135) # polar angle of wavefront source
 V = 400 * 1e3 # speed of wavefront propagation [m/s]
 T0 = 150 # time of wavefront transit of Earth [s]
 TAU = 1e-9 # bias in atomic clock induced by wavefront [s]
-ERR = 1e-10 # std of natural noise in atomic clocks [s]
+ERR = 1.0e-10 # std of natural noise in atomic clocks [s]
 
 ### wavefront fitting and fit analysis
 
@@ -153,7 +155,7 @@ def satellite_position(data, i, t):
 	i_k = i0 + di_k + i_dot*t_k
 	xp_k = r_k*np.cos(u_k)
 	yp_k = r_k*np.sin(u_k)
-	Omega_dot_e = 0 # 7.2921151467e-5 (EIEF)
+	Omega_dot_e = 0 # 7.2921151467e-5 (ECI frame)
 	Omega_k = Omega + (Omega_dot - Omega_dot_e)*t_k - Omega_dot_e*t_oe
 	x_k = xp_k*np.cos(Omega_k) - yp_k*np.cos(i_k)*np.sin(Omega_k)
 	y_k = xp_k*np.sin(Omega_k) + yp_k*np.cos(i_k)*np.cos(Omega_k)
@@ -194,23 +196,24 @@ def detector(t_start, runtime):
 	# Fast and memory efficient.
 
 	sensitivity = 7.5e-10
-	sample_time = 0.1 # s
+	sample_time = 0.5 # s
 	n_steps = int(runtime/sample_time)
 
 	state_iter = state_generator(t_start, sample_time)
-	t, ts_old, rs_old = next(state_iter)
+	t_old, ts_old, rs_old = next(state_iter)
 
 	for _ in tqdm(range(n_steps)):
-		t, ts_new, rs_new = next(state_iter)
+		t_new, ts_new, rs_new = next(state_iter)
 		dts = ts_new - ts_old
-		ts_old, rs_old = ts_new, rs_new
-		events = np.abs(dts) > sensitivity
+		t_old, ts_old, rs_old = t_new, ts_new, rs_new
+		events = np.sign(TAU)*dts > sensitivity
 		if np.any(events):
+			t_avg = (t_old + t_new)/2;
 			idx = np.where(events)
 			for i in idx[0]:
-				# average position value over time interval
+				# average over time interval
 				r_avg = (rs_old[i,:] + rs_new[i,:])/2
-				yield t, r_avg, dts[i]
+				yield t_avg, r_avg, dts[i]
 
 def analysis(t_start, runtime):
 	# Runs detector for set time and estimates wavefront parameters.
@@ -219,6 +222,26 @@ def analysis(t_start, runtime):
 	state = [(t, r, mag) for t, r, mag in detected]
 	ts, rs, mags = map(np.array, zip(*state))
 	(popt, pcov) = process_events(ts, rs)
+	badness = np.sqrt(np.diag(pcov))/popt
+
+	# outlier removal
+	residuals = np.abs(ts - [time_of_arrival(r, *popt) for r in rs])
+	idx = np.where(residuals <= 3*np.mean(residuals))[0]
+	(popt, pcov) = process_events(ts[idx], rs[idx,:])
+	badness = np.sqrt(np.diag(pcov))/popt
+
+	# jackknife resampling (worst case O(n^2))
+	if np.any(badness > 0.1):
+		n = len(ts)
+		orders = [1, 2]
+		for k in orders:
+			idx_full = np.arange(n)
+			for idx in combinations(idx_full, n-k):
+				idx = list(idx)
+				(popt, pcov) = process_events(ts[idx], rs[idx,:])
+				badness = np.sqrt(np.diag(pcov))/popt
+				if np.all(badness < 0.1):
+					break
 
 	t0 = popt[3]
 	std_t0 = np.sqrt(pcov[3, 3])
